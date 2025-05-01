@@ -1,189 +1,209 @@
-#include <SPI.h>
-#include <Wire.h>
+#include <Adafruit_NeoPixel.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <splash.h>
-#include <Adafruit_NeoPixel.h>
-#include <SoftwareSerial.h>
-#include <DFPlayerMini_Fast.h>
+#include <DFRobotDFPlayerMini.h>
 
-#define BUTTON_PIN 2
-#define RELOAD_BUTTON 8
-#define PIXEL_PIN 6  // Digital IO pin connected to the NeoPixels.
-#define PIXEL_COUNT 15  // Number of NeoPixels
-#define SWITCH_POSITION_A_PIN 15
-#define SWITCH_POSITION_B_PIN 16
+// --- Pin Definitions for Seeduino XIAO ---
+#define LED_PIN       8  // Moved from 6 to 8 to avoid DFPlayer TX conflict
+#define MODE_BUTTON   2
+#define RELOAD_BUTTON 3
+#define DISPLAY_TOGGLE_BUTTON 10  // Moved from 4 to avoid I2C SDA conflict
+#define TRIGGER_BUTTON 1
 
-int reloadAmmo = 10; // Number of ammo/shots
-int buttonPushCounter = reloadAmmo;
-int i; // Needed for FX loop
-int n = 7; // Needed for FX loop
-int rectOutline = 90; // Number of pixels the ammo rectangle is in height
-int ammoRectPlace = 37; // Placement of rectangle
-int rectFill = rectOutline / reloadAmmo;
-int ammoLeft;
+// DFPlayer Mini wiring for Seeduino XIAO:
+// DFPlayer TX → XIAO D7 (RX1)
+// DFPlayer RX → XIAO D6 (TX1) (Use a voltage divider if DFPlayer is 5V)
+// OLED uses I2C: SDA = D4, SCL = D5 — DO NOT share these pins with DFPlayer
 
-SoftwareSerial mySerial(11, 12); // RX, TX
-DFPlayerMini_Fast myDFPlayer;
+#define NUM_LEDS      15
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET    -1
 
-// Declare our NeoPixel strip object:
-Adafruit_NeoPixel strip(PIXEL_COUNT, PIXEL_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+DFRobotDFPlayerMini dfplayer;
 
-Adafruit_SSD1306 display = Adafruit_SSD1306(128, 32, &Wire);
+enum Mode { STUN, STING, BLAST };
+Mode currentMode = BLAST;
 
-boolean oldState = HIGH;
-boolean ammoOldState = HIGH; 
+int shotsRemaining = 100;
+unsigned long energy = 935135246;
+bool showBarGraph = true;
 
-void colorWipe(uint32_t color, int wait) {
-  for(int i=0; i<strip.numPixels(); i++) { // For each pixel in strip...
-    strip.setPixelColor(i, color);         //  Set pixel's color (in RAM)
-    strip.show();                          //  Update strip to match
-    delay(wait);                           //  Pause for a moment
+unsigned long lastModePress = 0;
+unsigned long lastReloadPress = 0;
+unsigned long lastTogglePress = 0;
+unsigned long lastTriggerPress = 0;
+
+void setup() {
+  pinMode(MODE_BUTTON, INPUT_PULLUP);
+  pinMode(RELOAD_BUTTON, INPUT_PULLUP);
+  pinMode(DISPLAY_TOGGLE_BUTTON, INPUT_PULLUP);
+  pinMode(TRIGGER_BUTTON, INPUT_PULLUP);
+
+  strip.begin();
+  strip.show();
+
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.setRotation(1); // Portrait mode
+  display.clearDisplay();
+  display.display();
+
+  Serial.begin(115200);
+  while (!Serial && millis() < 2000);
+
+  Serial1.begin(9600);
+  if (!dfplayer.begin(Serial1)) {
+    display.setCursor(0, 0);
+    display.print("DFPlayer FAIL");
+    display.display();
+    while (true);
+  }
+  dfplayer.volume(25);
+
+  showBootAnimation();
+  updateDisplay();
+}
+
+void loop() {
+  if (digitalRead(MODE_BUTTON) == LOW && millis() - lastModePress > 300) {
+    currentMode = static_cast<Mode>((currentMode + 1) % 3);
+    lastModePress = millis();
+    updateDisplay();
+  }
+
+  if (digitalRead(RELOAD_BUTTON) == LOW && millis() - lastReloadPress > 300) {
+    shotsRemaining = 100;
+    energy = 935135246;
+    dfplayer.playMp3Folder(4);
+    lastReloadPress = millis();
+    updateDisplay();
+  }
+
+  if (digitalRead(DISPLAY_TOGGLE_BUTTON) == LOW && millis() - lastTogglePress > 300) {
+    showBarGraph = !showBarGraph;
+    lastTogglePress = millis();
+    updateDisplay();
+  }
+
+  if (digitalRead(TRIGGER_BUTTON) == LOW && millis() - lastTriggerPress > 300) {
+    lastTriggerPress = millis();
+    fireBlaster();
   }
 }
 
-void setup() {
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(RELOAD_BUTTON, INPUT_PULLUP);
-  pinMode(SWITCH_POSITION_A_PIN, INPUT_PULLUP);      
-  pinMode(SWITCH_POSITION_B_PIN, INPUT_PULLUP);
-  strip.begin(); // Initialize NeoPixel strip object (REQUIRED)
-  strip.show();  // Initialize all pixels to 'off'
-  Serial.begin(115200);
-  mySerial.begin(9600);
-  myDFPlayer.begin(mySerial);
-  myDFPlayer.play(1); //play mp3 file with leading identifier "0001"
+void colorWipe(uint32_t color, int wait) {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    strip.setPixelColor(i, color);
+    strip.show();
+    delay(wait);
+  }
+  strip.clear();
+  strip.show();
+}
 
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C); // Address 0x3C for 128x32
+void fireBlaster() {
+  if (shotsRemaining <= 0) {
+    dfplayer.playMp3Folder(5);
+    return;
+  }
 
-  Serial.println("OLED begun");
+  switch (currentMode) {
+    case STUN:
+      dfplayer.playMp3Folder(1);
+      colorWipe(strip.Color(0, 0, 255), 30);
+      break;
+    case STING:
+      dfplayer.playMp3Folder(2);
+      colorWipe(strip.Color(255, 50, 0), 10);
+      break;
+    case BLAST:
+      dfplayer.playMp3Folder(3);
+      colorWipe(strip.Color(150, 0, 0), 10);
+      break;
+  }
+
+  shotsRemaining--;
+  energy = map(shotsRemaining, 0, 100, 0, 935135246);
+
+  updateDisplay();
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+
+  if (showBarGraph) {
+    const int segmentCount = 15;
+    const int segmentHeight = (SCREEN_HEIGHT - 10) / segmentCount;
+    int segmentsToDraw = map(shotsRemaining, 0, 100, 0, segmentCount);
+
+    for (int i = 0; i < segmentsToDraw; i++) {
+      int y = SCREEN_HEIGHT - 10 - (i + 1) * segmentHeight;
+      display.fillRect(SCREEN_WIDTH / 2 - 4, y, 8, segmentHeight - 1, WHITE);
+      display.display();
+      delay(20); // blink animation
+    }
+
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor((SCREEN_WIDTH - 36) / 2, SCREEN_HEIGHT - 8);
+    switch (currentMode) {
+      case STUN: display.print("STUN"); break;
+      case STING: display.print("STING"); break;
+      case BLAST: display.print("LETHAL"); break;
+    }
+  } else {
+    display.setTextSize(2);
+    display.setTextColor(WHITE);
+
+    char buffer[12];
+    sprintf(buffer, "%09lu", energy);
+
+    for (int i = 0; i < 9; i++) {
+      display.setCursor(i * 14, 0);
+      display.write(buffer[i]);
+    }
+
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor((SCREEN_WIDTH - 36) / 2, SCREEN_HEIGHT - 8);
+    switch (currentMode) {
+      case STUN: display.print("STUN"); break;
+      case STING: display.print("STING"); break;
+      case BLAST: display.print("LETHAL"); break;
+    }
+  }
+
+  display.display();
+}
+
+const unsigned char empire_logo [] PROGMEM = {
+  0x00, 0x7E, 0xFF, 0x81, 0xA5, 0x81, 0xBD, 0x81,
+  0xBD, 0x81, 0xA5, 0x81, 0xFF, 0x7E, 0x00, 0x00,
+};
+
+void showBootAnimation() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
+  display.setCursor(0, 0);
+  display.println("Connecting to HUD...");
   display.display();
   delay(1000);
 
-  // Clear the buffer.
-  display.clearDisplay();
+  float voltage = analogRead(A0) * (3.3 / 1023.0) * 2.0;
+  display.setCursor(0, 10);
+  display.print("Powercell V: ");
+  display.println(voltage, 2);
   display.display();
+  delay(1000);
 
-  // text display tests
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0,0);
-  display.display(); // actually display all of the above
-  display.setRotation(3);  
-}
-
-void blaster() {
-  myDFPlayer.volume(20); //set volume low
-  while(0); //halt
-}
-
-void shooting(int sound, int color, int repeat){
-    // Get current button state.
-  boolean newState = digitalRead(BUTTON_PIN); 
-  // Check if state changed from high to low (button press).
-  if((newState == LOW) && (oldState == HIGH)) {
-    // Short delay to debounce button.
-    delay(20);
-    // Check if button is still low after debounce.
-    newState = digitalRead(BUTTON_PIN);
-    if(newState == LOW) {      // Yes, still low 
-      buttonPushCounter--;
-      ammoLeft++;
-      blaster();
-      myDFPlayer.play(sound); // which sound on the DFPLayer do you want?
-      rectFill = rectOutline / reloadAmmo;
-      for (int i = 0; i < repeat; i++) {      
-        if(color == 'red'){
-          colorWipe(strip.Color(255,   0,   0), 2);
-        } else if (color == 'orange'){
-          colorWipe(strip.Color(255,   100,   0), 9);
-        } else if (color == 'blue') {
-          colorWipe(strip.Color(0,   9,   255), 2);
-        }
-        colorWipe(strip.Color(  0,   0,   0), 1);    // Black/off
-      }                                                     
-    }
-  }
-
-  // Set the last-read button state to the old state.
-  oldState = newState;
-
-  delay(20);
   display.clearDisplay();
-  display.setCursor(0,0);
-  display.setTextSize(1);
-
-  if(color == 'red'){
-    display.println("RPT"); 
-    Serial.println("Repeat");
-  } else if (color == 'orange'){
-    display.println("Sting");
-    Serial.println("Sting"); 
-  } else if (color == 'blue') {
-    display.println("Stun"); 
-    Serial.println("STUN");
-  }  
-  
-}
-
-
-
-void loop(){
-  display.setCursor(0,0);
-
-  int READ_SWITCH_POSITION_A = digitalRead(SWITCH_POSITION_A_PIN);
-  int READ_SWITCH_POSITION_B = digitalRead(SWITCH_POSITION_B_PIN);
-
-  boolean newState = digitalRead(BUTTON_PIN);
-  boolean ammoNewState = digitalRead(RELOAD_BUTTON);
-
-
-  if (buttonPushCounter <= 0) {
-    newState = HIGH;
-    Serial.println("Out of Ammo!");
-//    display.drawRect(0, ammoRectPlace, 32, rectOutline, WHITE);    
-    display.display();    
-  } else { 
-    Serial.println(ammoLeft);
-    if(READ_SWITCH_POSITION_A == HIGH && READ_SWITCH_POSITION_B == HIGH){
-      //stun();         
-      shooting(4, 'blue', 7);
-    } else if(READ_SWITCH_POSITION_A == LOW && READ_SWITCH_POSITION_B == HIGH){
-      //repeating();
-      shooting(4, 'red', 1);
-    } else if(READ_SWITCH_POSITION_A == HIGH && READ_SWITCH_POSITION_B == LOW){
-      //sting();
-      shooting(4, 'orange', 1);        
-    }
-    Serial.println("PLenty of Ammo");
-    display.setCursor(0,20);
-    display.setTextSize(1.25);
-    if (buttonPushCounter < 10) {
-      display.print(" 00") + 
-      display.println(buttonPushCounter);
-    } else if (buttonPushCounter >= 10) {
-      display.print(" 0");
-      display.println(buttonPushCounter);      
-    } else if (buttonPushCounter >= 100) {
-      display.println(buttonPushCounter);
-    }
-    int ammo = buttonPushCounter * rectFill;
-    display.drawRect(0, ammoRectPlace, 32, rectOutline, WHITE);
-    if (buttonPushCounter == reloadAmmo) {
-      display.fillRect(0, ammoRectPlace, 32, rectOutline, WHITE);      
-    } else {
-      display.fillRect(0, ammoRectPlace + rectFill * ammoLeft, 32, rectOutline, WHITE);
-    }
-  }
-
-  if((ammoNewState == LOW) && (ammoOldState == HIGH)) {
-    // Short delay to debounce button.
-    delay(20);
-    if(ammoNewState == LOW) { 
-      buttonPushCounter = reloadAmmo;
-    }
-  }
-
-  ammoOldState = ammoNewState;
+  display.drawBitmap((SCREEN_WIDTH - 32) / 2, 0, empire_logo, 32, 32, WHITE);
   display.display();
+  dfplayer.playMp3Folder(6);
+  delay(2500);
+  display.clearDisplay();
 }
